@@ -1,0 +1,15 @@
+# Local Gradle and Android build output
+.gradle/
+build/
+app/build/
+.kotlin/
+
+# Local signing material and machine-specific files
+*.jks
+*.keystore
+local.properties
+
+# Keep only the current distributable APK in the repository.
+dist/*.apk
+dist/*.idsig
+!dist/FloatingTranslator-0.2.1-MagicOS10-RealOCR-ARM64.apk
