@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Material Design translate icon path, used as a monochrome notification mark. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12.87,15.07L10.33,12.56L10.36,12.53C12.1,10.59 13.34,8.36 14.07,6L17,6L17,4L10,4L10,2L8,2L8,4L1,4L1,5.99L12.17,5.99C11.5,7.92 10.21,9.83 8.5,11.49C7.4,10.39 6.48,9.2 5.74,8L3.72,8C4.53,9.52 5.56,11.02 6.8,12.38L1.43,17.2L2.84,18.61L7.97,13.48L11.19,16.7L12.87,15.07ZM18.5,10L16.5,10L12,22L14,22L15.12,19L19.87,19L21,22L23,22L18.5,10ZM15.88,17L17.5,12.67L19.12,17L15.88,17Z" />
+</vector>

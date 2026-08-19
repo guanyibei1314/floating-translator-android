@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="surface">#F7F8FC</color>
+    <color name="ink">#152238</color>
+    <color name="muted_text">#667085</color>
+    <color name="blue">#2563EB</color>
+    <color name="blue_dark">#1D4ED8</color>
+    <color name="success_text">#087443</color>
+    <color name="warning_text">#9A6700</color>
+    <color name="success_fill">#E9F8EF</color>
+    <color name="warning_fill">#FFF6D8</color>
+    <color name="neutral_fill">#EEF1F5</color>
+    <color name="line">#E4E7EC</color>
+    <color name="panel">#FFFFFF</color>
+    <color name="launcher_background">#1D4ED8</color>
+</resources>
