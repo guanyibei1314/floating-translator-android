@@ -11,7 +11,7 @@
       model on first use, and also by ML Kit's own reporting: the bundled Google
       libraries send usage/diagnostic events and use a Firebase installation ID.
       That reporting is on by default and there is no opt-out in these ML Kit
-      versions. Text recognized from the screen is never part of it -- OCR and
+      versions. Text recognized from the screen is never part of it: OCR and
       translation both run on device and the results stay in this process.
     -->
     <uses-permission android:name="android.permission.INTERNET" />

@@ -33,6 +33,24 @@ jobs:
       - name: Validate Gradle wrapper
         uses: gradle/actions/wrapper-validation@v4
 
+      # A malformed manifest or resource only surfaces a minute into Gradle
+      # configuration, so check well-formedness up front where it costs nothing.
+      - name: Validate XML resources
+        run: |
+          python3 - <<'PY'
+          import glob, sys, xml.dom.minidom as md
+          bad = []
+          for path in sorted(glob.glob('app/src/**/*.xml', recursive=True)):
+              try:
+                  md.parse(path)
+              except Exception as exc:
+                  bad.append(f"{path}: {exc}")
+          for line in bad:
+              print(f"malformed: {line}")
+          print(f"checked {len(glob.glob('app/src/**/*.xml', recursive=True))} files, {len(bad)} malformed")
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: Assemble release
         run: ./gradlew --no-daemon assembleRelease
 
