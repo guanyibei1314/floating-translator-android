@@ -13,9 +13,14 @@
 3. **不变式检查**。直接在字节码里确认屏幕像素通路的开关点各自只有哪些调用方。
 4. **结构性检查**。确认承载屏幕文字的类型无法被序列化跨进程。
 
-**没有执行（本环境没有实体机、模拟器、ADB，且 `dl.google.com` / `android.googlesource.com` / `services.gradle.org` 均被出网策略拦截，装不了 Android SDK）：**
+5. **完整 APK 构建（在 GitHub Actions 上）**。本沙箱装不了 Android SDK，但 CI runner 可以：`assembleRelease` 用真实 AGP 8.7.3 + 真实 ML Kit 依赖 + R8 构建通过（2 分 45 秒），`lintRelease` 通过，`gradle-wrapper.jar` 通过 Gradle 官方校验和验证。见 run `32464706824`。
 
-- 构建 APK、安装、真机运行
+   第一次 CI 构建失败于 `:app:processReleaseMainManifest`：本次修改在 `AndroidManifest.xml` 的注释里引入了一个 `--`，XML 注释不允许该序列，导致 manifest 无法解析。已修复，并在工作流中加了 XML 格式前置检查。**这个问题是纯 Kotlin 类型检查发现不了的**，说明只做源码级验证不够。
+
+**没有执行（本环境没有实体机、模拟器、ADB，且 `dl.google.com` / `android.googlesource.com` / `services.gradle.org` / Actions artifact 的 blob 存储均被出网策略拦截）：**
+
+- 在本沙箱内构建 APK、下载 CI 产物做二进制复核
+- 安装、真机运行
 - `adb shell am broadcast` 之类的动态注入
 - 抓包确认 ML Kit 遥测的实际流量
 - MagicOS 后台保活、授权弹窗、剪贴板预览气泡的实机表现
@@ -52,7 +57,7 @@
 
 1. **ML Kit 遥测**。APK 中 `enableFirelog=true`，并带有 Firebase Installations（`firebaseinstallations.googleapis.com`）与 Remote Config 端点，以及 CCT/datatransport 上报组件。这意味着应用会向 Google 发送使用统计，并持有一个跨会话可关联的安装标识。**屏幕文字不在其中**——OCR 与翻译都在端侧完成，结果不出进程。当前 ML Kit 版本没有找到公开的关闭开关，因此本版只做了如实披露（`AndroidManifest.xml` 注释与 README），没有伪称已关闭。要真正去掉，只能换掉 ML Kit。
 2. **请求窗口内的屏幕帧仍会进入本进程堆**。这是功能本身，无法消除；能做的是把窗口从"整个会话"压到"每次点击的一帧"，本版已经这么做了。
-3. **`dist/` 里的 APK 是 0.2.1，不包含本次任何修复**。本沙箱装不了 Android SDK，无法重新构建。安装前必须自行用 `./gradlew assembleRelease` 重新出包。
+3. **`dist/` 里的 APK 是 0.2.1，不包含本次任何修复**。0.3.0 的 APK 由 GitHub Actions 构建并作为 artifact 提供，但**未签名**（仓库未配置签名密钥），不能直接安装；签名方式见 README。
 4. **Gradle 发行版校验和未填**。`gradle/wrapper/gradle-wrapper.properties` 里 `distributionSha256Sum` 留了 TODO 和取值命令，因为 `services.gradle.org` 在本沙箱不可达。
 
 ## 必须在真机上验证的行为

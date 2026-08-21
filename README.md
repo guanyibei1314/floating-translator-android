@@ -40,11 +40,24 @@
 
 ## 构建
 
+每次向 `main` 或 `claude/**` 推送都会触发 GitHub Actions 构建，产物是一个名为 `floating-translator-apk` 的 artifact，可在对应的 workflow run 页面下载；run summary 里会打印 APK 的 SHA-256，便于核对下载到的文件。
+
+本地构建：
+
 ```
 ./gradlew assembleRelease
 ```
 
-Gradle Wrapper 已固定为 8.14.3。`gradle/wrapper/gradle-wrapper.properties` 里的 `distributionSha256Sum` 还是 TODO，文件内注明了取值命令，建议在有网络的机器上补齐后再用于正式发布。release 构建没有配置 `signingConfig`，签名需要自行完成。
+Gradle Wrapper 已固定为 8.14.3，CI 会用 Gradle 官方发布的校验和校验 `gradle-wrapper.jar`。`gradle/wrapper/gradle-wrapper.properties` 里的 `distributionSha256Sum` 还是 TODO，文件内注明了取值命令，建议在有网络的机器上补齐后再用于正式发布。
+
+### 签名
+
+release 构建没有配置 `signingConfig`，所以 CI 产出的是**未签名 APK，不能直接安装**。两种做法：
+
+1. 在仓库 Settings → Secrets 里配置 `KEYSTORE_BASE64`（keystore 文件的 base64）、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`，CI 会自动 zipalign + 签名，并打印签名证书指纹。
+2. 下载未签名 APK，自己用 `apksigner` 签。
+
+**必须使用与 0.2.1 相同的签名密钥**（证书 SHA-256 见下），否则无法覆盖安装，需要先卸载旧版。
 
 ## 关于 dist/ 里的安装包
 
