@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -20,6 +21,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.DisplayMetrics
+import android.view.Surface
 import android.view.WindowManager
 import android.content.pm.ServiceInfo
 import com.google.mlkit.common.model.DownloadConditions
@@ -35,14 +37,25 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 
 /**
  * Owns the MediaProjection session and performs the real OCR/translation work.
- * No screenshot bitmap is sent through a broadcast. Only recognized source and
- * translated strings are sent back to the overlay service.
+ *
+ * The session holds a MediaProjection and a single VirtualDisplay, but the
+ * display has **no output surface** except while a translation request is in
+ * flight. Android 14+ forbids calling createVirtualDisplay() more than once per
+ * MediaProjection, so the display itself is long-lived; attaching and detaching
+ * its surface is what gates the pixels. Between taps the display renders
+ * nowhere, so no screen content reaches this process at all.
+ *
+ * Results stay in-process: recognized and translated strings go to the overlay
+ * through CaptureBus, never through a broadcast.
  */
 class ScreenCaptureService : Service() {
     private var projection: MediaProjection? = null
     private var projectionCallback: MediaProjection.Callback? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
+    private var captureWidth = 0
+    private var captureHeight = 0
+    private var surfaceAttached = false
     private var textRecognizer: TextRecognizer? = null
     private var translator: Translator? = null
 
@@ -50,7 +63,6 @@ class ScreenCaptureService : Service() {
     private var sessionGeneration = 0L
     private var activeGeneration = 0L
     private var frameSequence = 0L
-    private var requestedAfterFrame = 0L
     private var pendingRequestId = 0L
     private var translationPending = false
     private var processingFrame = false
@@ -58,6 +70,7 @@ class ScreenCaptureService : Service() {
     private var processingGeneration = 0L
     private var processingBitmap: Bitmap? = null
     private var translationModelReady = false
+    private var consecutiveTimeouts = 0
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -66,6 +79,7 @@ class ScreenCaptureService : Service() {
             val requestId = pendingRequestId
             translationPending = false
             pendingRequestId = 0L
+            detachCaptureSurface()
             sendCaptureResult(
                 captured = false,
                 sessionId = activeGeneration,
@@ -73,6 +87,16 @@ class ScreenCaptureService : Service() {
                 frame = frameSequence,
                 errorMessage = getString(R.string.error_capture_timeout),
             )
+            // One timeout can just be a slow first frame, so the session gets
+            // another chance. Repeated timeouts mean it is wedged -- most likely
+            // the display never resumed after its surface was re-attached -- so
+            // drop it. The next tap then rebuilds the projection from scratch
+            // (asking for consent again) instead of leaving a session that
+            // silently never captures anything.
+            consecutiveTimeouts += 1
+            if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+                endSession(notifyPending = false)
+            }
         }
     }
 
@@ -96,10 +120,7 @@ class ScreenCaptureService : Service() {
                 val requestId = captureIntent.getLongExtra(AppContracts.EXTRA_REQUEST_ID, 0L)
                 queueTranslationRequest(requestId)
                 if (projection == null) {
-                    sendInternalBroadcast(
-                        Intent(AppContracts.ACTION_CAPTURE_PERMISSION_NEEDED)
-                            .putExtra(AppContracts.EXTRA_REQUEST_ID, requestId),
-                    )
+                    CaptureBus.permissionNeeded(requestId)
                     stopSelf()
                 }
                 START_NOT_STICKY
@@ -121,15 +142,27 @@ class ScreenCaptureService : Service() {
 
     private fun queueTranslationRequest(requestId: Long) {
         if (requestId <= 0L || sessionStopping) return
+        // Screen pixels start flowing here and stop again as soon as one frame
+        // has been taken (startFrameProcessing) or the request expires
+        // (requestTimeout). Outside that window the display has no surface.
+        if (virtualDisplay != null && !attachCaptureSurface()) {
+            sendCaptureResult(
+                captured = false,
+                sessionId = activeGeneration,
+                requestId = requestId,
+                frame = frameSequence,
+                errorMessage = getString(R.string.error_capture_start_failed),
+            )
+            return
+        }
         translationPending = true
         pendingRequestId = requestId
-        requestedAfterFrame = frameSequence
         mainHandler.removeCallbacks(requestTimeout)
         mainHandler.postDelayed(requestTimeout, REQUEST_TIMEOUT_MS)
     }
 
     private fun startCaptureSession(captureIntent: Intent) {
-        if (projection != null || virtualDisplay != null || imageReader != null) {
+        if (projection != null || virtualDisplay != null) {
             val requestId = captureIntent.getLongExtra(AppContracts.EXTRA_REQUEST_ID, 0L)
             if (!sessionStopping) queueTranslationRequest(requestId)
             return
@@ -146,10 +179,7 @@ class ScreenCaptureService : Service() {
             null
         }
         if (resultCode != Activity.RESULT_OK || data == null) {
-            sendInternalBroadcast(
-                Intent(AppContracts.ACTION_CAPTURE_PERMISSION_NEEDED)
-                    .putExtra(AppContracts.EXTRA_REQUEST_ID, requestId),
-            )
+            CaptureBus.permissionNeeded(requestId)
             stopSelf()
             return
         }
@@ -158,11 +188,11 @@ class ScreenCaptureService : Service() {
         sessionGeneration += 1
         activeGeneration = sessionGeneration
         frameSequence = 0L
-        requestedAfterFrame = 0L
         pendingRequestId = 0L
         translationPending = false
         processingFrame = false
         translationModelReady = false
+        consecutiveTimeouts = 0
         val initialCaptureRequested = captureIntent.getBooleanExtra(
             AppContracts.EXTRA_CAPTURE_REQUESTED,
             true,
@@ -204,7 +234,7 @@ class ScreenCaptureService : Service() {
             }
             projectionCallback = callback
             projection?.registerCallback(callback, mainHandler)
-            if (!startContinuousCapture(generation)) {
+            if (!createCaptureDisplay(generation)) {
                 failSession(getString(R.string.error_capture_start_failed))
                 return
             }
@@ -219,46 +249,118 @@ class ScreenCaptureService : Service() {
             return
         }
 
-        sendInternalBroadcast(
-            Intent(AppContracts.ACTION_CAPTURE_SESSION_STARTED)
-                .putExtra(AppContracts.EXTRA_SESSION_ID, activeGeneration),
-        )
-        if (initialCaptureRequested) queueTranslationRequest(requestId)
+        CaptureBus.sessionStarted(activeGeneration)
+        if (initialCaptureRequested) {
+            queueTranslationRequest(requestId)
+        } else {
+            detachCaptureSurface()
+        }
     }
 
+    /**
+     * Creates the one VirtualDisplay this session is allowed to have. Android 14+
+     * throws a SecurityException on a second createVirtualDisplay() for the same
+     * MediaProjection, so the display outlives individual requests and only its
+     * surface is attached and detached.
+     */
     @Suppress("DEPRECATION")
-    private fun startContinuousCapture(generation: Long): Boolean {
+    private fun createCaptureDisplay(generation: Long): Boolean {
         val metrics = DisplayMetrics()
         val windowManager = getSystemService(WindowManager::class.java) ?: return false
         windowManager.defaultDisplay.getRealMetrics(metrics)
 
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        return try {
-            imageReader = ImageReader.newInstance(
-                width,
-                height,
-                PixelFormat.RGBA_8888,
-                2,
-            )
-            imageReader?.setOnImageAvailableListener(
-                { reader -> onImageAvailable(reader, generation) },
-                mainHandler,
-            )
+        captureWidth = metrics.widthPixels
+        captureHeight = metrics.heightPixels
+        if (captureWidth <= 0 || captureHeight <= 0) return false
 
+        val reader = newImageReader(generation) ?: return false
+        return try {
+            imageReader = reader
             virtualDisplay = projection?.createVirtualDisplay(
                 "FloatingTranslatorCapture",
-                width,
-                height,
+                captureWidth,
+                captureHeight,
                 metrics.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader?.surface,
+                reader.surface,
                 null,
                 null,
             )
-            virtualDisplay != null
+            surfaceAttached = virtualDisplay != null
+            if (!surfaceAttached) closeImageReader()
+            surfaceAttached
         } catch (_: RuntimeException) {
+            closeImageReader()
             false
+        }
+    }
+
+    private fun newImageReader(generation: Long): ImageReader? {
+        return try {
+            // A fresh reader per request: buffers acquired for an earlier request
+            // can never be handed to a later one.
+            ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 2).apply {
+                setOnImageAvailableListener(
+                    { reader -> onImageAvailable(reader, generation) },
+                    mainHandler,
+                )
+            }
+        } catch (_: RuntimeException) {
+            null
+        }
+    }
+
+    /** Points the session's display at a new reader so one frame can be taken. */
+    private fun attachCaptureSurface(): Boolean {
+        if (surfaceAttached) return true
+        val display = virtualDisplay ?: return false
+        val reader = newImageReader(activeGeneration) ?: return false
+        return try {
+            display.surface = reader.surface
+            imageReader = reader
+            surfaceAttached = true
+            true
+        } catch (_: RuntimeException) {
+            closeReader(reader)
+            false
+        }
+    }
+
+    /**
+     * Detaches the display's surface. The display stays alive but renders
+     * nowhere, so the process stops receiving screen content entirely until the
+     * next request attaches a new reader.
+     */
+    private fun detachCaptureSurface() {
+        val display = virtualDisplay
+        if (display != null && surfaceAttached) {
+            try {
+                display.surface = null
+            } catch (_: RuntimeException) {
+                // The display may already be released; the reader is closed below.
+            }
+        }
+        surfaceAttached = false
+        closeImageReader()
+    }
+
+    private fun closeImageReader() {
+        val reader = imageReader
+        imageReader = null
+        closeReader(reader)
+    }
+
+    private fun closeReader(reader: ImageReader?) {
+        if (reader == null) return
+        try {
+            reader.setOnImageAvailableListener(null, null)
+        } catch (_: RuntimeException) {
+            // The reader may already be closed by the system.
+        }
+        try {
+            reader.close()
+        } catch (_: RuntimeException) {
+            // Nothing further to release on this reader.
         }
     }
 
@@ -269,13 +371,15 @@ class ScreenCaptureService : Service() {
             null
         } ?: return
 
-        if (sessionStopping || generation != activeGeneration) {
+        // Anything from a stopped session, an older generation, or a reader that
+        // belonged to a previous request is discarded without being read.
+        if (sessionStopping || generation != activeGeneration || reader !== imageReader) {
             closeImage(image)
             return
         }
 
         frameSequence += 1
-        if (!translationPending || processingFrame || frameSequence <= requestedAfterFrame) {
+        if (!translationPending || processingFrame) {
             closeImage(image)
             return
         }
@@ -290,15 +394,16 @@ class ScreenCaptureService : Service() {
     private fun startFrameProcessing(image: Image, generation: Long, requestId: Long) {
         if (requestId <= 0L || processingFrame) {
             closeImage(image)
+            detachCaptureSurface()
             return
         }
 
         processingFrame = true
         processingRequestId = requestId
         processingGeneration = generation
+        consecutiveTimeouts = 0
         mainHandler.removeCallbacks(processingTimeout)
         mainHandler.postDelayed(processingTimeout, PROCESSING_TIMEOUT_MS)
-        sendTranslationStatus(getString(R.string.status_reading_screen))
 
         val bitmap = try {
             imageToBitmap(image)
@@ -307,6 +412,9 @@ class ScreenCaptureService : Service() {
         } finally {
             closeImage(image)
         }
+        // One frame is all this request needed. Stop the display from producing
+        // any more before spending the next seconds in OCR and translation.
+        detachCaptureSurface()
 
         if (bitmap == null) {
             finishProcessing(
@@ -371,9 +479,6 @@ class ScreenCaptureService : Service() {
             return
         }
 
-        sendTranslationStatus(
-            getString(R.string.status_translating, lines.size),
-        )
         downloadModelAndTranslate(generation, requestId, lines)
     }
 
@@ -421,7 +526,6 @@ class ScreenCaptureService : Service() {
             return
         }
 
-        sendTranslationStatus(getString(R.string.status_preparing_model))
         try {
             currentTranslator.downloadModelIfNeeded(DownloadConditions.Builder().build())
                 .addOnSuccessListener {
@@ -537,6 +641,7 @@ class ScreenCaptureService : Service() {
         processingRequestId = 0L
         processingGeneration = 0L
         mainHandler.removeCallbacks(processingTimeout)
+        detachCaptureSurface()
         releaseProcessingBitmap()
         sendCaptureResult(
             captured = captured,
@@ -558,38 +663,16 @@ class ScreenCaptureService : Service() {
         translatedLines: List<String> = emptyList(),
         errorMessage: String? = null,
     ) {
-        val result = Intent(AppContracts.ACTION_CAPTURE_FINISHED)
-            .putExtra(AppContracts.EXTRA_CAPTURED, captured)
-            .putExtra(AppContracts.EXTRA_SESSION_ID, sessionId)
-            .putExtra(AppContracts.EXTRA_REQUEST_ID, requestId)
-            .putExtra(AppContracts.EXTRA_FRAME_SEQUENCE, frame)
-            .putStringArrayListExtra(AppContracts.EXTRA_SOURCE_LINES, ArrayList(sourceLines))
-            .putStringArrayListExtra(
-                AppContracts.EXTRA_TRANSLATED_LINES,
-                ArrayList(translatedLines),
-            )
-        if (!errorMessage.isNullOrBlank()) {
-            result.putExtra(AppContracts.EXTRA_ERROR_MESSAGE, errorMessage)
-        }
-        sendInternalBroadcast(result)
-    }
-
-    private fun sendTranslationStatus(status: String) {
-        sendInternalBroadcast(
-            Intent(AppContracts.ACTION_TRANSLATION_STATUS)
-                .putExtra(AppContracts.EXTRA_STATUS_MESSAGE, status),
+        CaptureBus.result(
+            CaptureResult(
+                sessionId = sessionId,
+                requestId = requestId,
+                captured = captured,
+                sourceLines = sourceLines,
+                translatedLines = translatedLines,
+                errorMessage = errorMessage?.takeIf { it.isNotBlank() },
+            ),
         )
-    }
-
-    private fun sendInternalBroadcast(intent: Intent) {
-        try {
-            sendBroadcast(
-                intent.setPackage(packageName),
-                AppContracts.INTERNAL_CAPTURE_RESULT_PERMISSION,
-            )
-        } catch (_: RuntimeException) {
-            // Status delivery must never prevent capture or ML Kit cleanup.
-        }
     }
 
     private fun endSession(notifyPending: Boolean) {
@@ -610,10 +693,7 @@ class ScreenCaptureService : Service() {
         processingGeneration = 0L
         releaseProcessingBitmap()
 
-        sendInternalBroadcast(
-            Intent(AppContracts.ACTION_CAPTURE_SESSION_STOPPED)
-                .putExtra(AppContracts.EXTRA_SESSION_ID, closingSessionId),
-        )
+        CaptureBus.sessionStopped(closingSessionId)
         if (notifyPending) {
             val requestId = if (hadProcessingRequest) processingRequest else closingRequestId
             if ((hadProcessingRequest || hadPendingRequest) && requestId > 0L) {
@@ -633,16 +713,22 @@ class ScreenCaptureService : Service() {
 
     private fun failSession(errorMessage: String) {
         endSession(notifyPending = true)
-        sendInternalBroadcast(
-            Intent(AppContracts.ACTION_CAPTURE_PERMISSION_CANCELLED)
-                .putExtra(AppContracts.EXTRA_ERROR_MESSAGE, errorMessage),
-        )
+        CaptureBus.permissionCancelled()
     }
 
     private fun releaseProcessingBitmap(bitmap: Bitmap? = null) {
         val current = processingBitmap
         if (bitmap != null && current !== bitmap) return
         processingBitmap = null
+        try {
+            // Overwrite the screen pixels before releasing the buffer, so they
+            // are not sitting in freed heap memory for a later dump to find.
+            if (current != null && !current.isRecycled && current.isMutable) {
+                current.eraseColor(Color.TRANSPARENT)
+            }
+        } catch (_: RuntimeException) {
+            // Scrubbing is best effort; the recycle below still runs.
+        }
         try {
             current?.recycle()
         } catch (_: RuntimeException) {
@@ -651,25 +737,15 @@ class ScreenCaptureService : Service() {
     }
 
     private fun releaseCapture() {
+        // Cut the pixel path first, then tear down what produced it.
+        detachCaptureSurface()
+
         val currentDisplay = virtualDisplay
         virtualDisplay = null
         try {
             currentDisplay?.release()
         } catch (_: RuntimeException) {
             // Continue releasing the remaining capture resources.
-        }
-
-        val currentReader = imageReader
-        imageReader = null
-        try {
-            currentReader?.setOnImageAvailableListener(null, null)
-        } catch (_: RuntimeException) {
-            // The reader may already be closed by the system.
-        }
-        try {
-            currentReader?.close()
-        } catch (_: RuntimeException) {
-            // Continue releasing the projection.
         }
 
         val currentProjection = projection
@@ -695,7 +771,8 @@ class ScreenCaptureService : Service() {
         translator = null
         translationModelReady = false
         frameSequence = 0L
-        requestedAfterFrame = 0L
+        captureWidth = 0
+        captureHeight = 0
     }
 
     override fun onDestroy() {
@@ -835,6 +912,7 @@ class ScreenCaptureService : Service() {
         private const val CHANNEL_ID = "screen_capture"
         private const val NOTIFICATION_ID = 6201
         private const val REQUEST_TIMEOUT_MS = 3_000L
+        private const val MAX_CONSECUTIVE_TIMEOUTS = 2
         private const val PROCESSING_TIMEOUT_MS = 90_000L
         private const val MAX_OCR_DIMENSION = 2048
         private const val MAX_TRANSLATION_LINES = 24

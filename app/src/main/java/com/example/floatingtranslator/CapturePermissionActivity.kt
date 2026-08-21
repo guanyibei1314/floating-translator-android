@@ -60,14 +60,7 @@ class CapturePermissionActivity : Activity() {
     }
 
     private fun notifyPermissionCancelled() {
-        try {
-            sendBroadcast(
-                Intent(AppContracts.ACTION_CAPTURE_PERMISSION_CANCELLED).setPackage(packageName),
-                AppContracts.INTERNAL_CAPTURE_RESULT_PERMISSION,
-            )
-        } catch (_: RuntimeException) {
-            // The activity is finishing; the next user tap can retry the flow.
-        }
+        CaptureBus.permissionCancelled()
     }
 
     companion object {

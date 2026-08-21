@@ -4,16 +4,16 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.BroadcastReceiver
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Build
 import android.os.IBinder
+import android.os.PersistableBundle
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -27,7 +27,7 @@ import android.content.pm.ServiceInfo
 import kotlin.math.abs
 import kotlin.math.max
 
-class FloatingTranslatorService : Service() {
+class FloatingTranslatorService : Service(), CaptureBus.Listener {
     private val windowManager: WindowManager by lazy {
         getSystemService(WindowManager::class.java)
             ?: error("Window manager is unavailable")
@@ -39,76 +39,51 @@ class FloatingTranslatorService : Service() {
     private var pendingRequestId: Long? = null
     private var nextRequestId = 0L
 
-    private val captureReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                AppContracts.ACTION_CAPTURE_FINISHED -> {
-                    val sessionId = intent.getLongExtra(AppContracts.EXTRA_SESSION_ID, -1L)
-                    val requestId = intent.getLongExtra(AppContracts.EXTRA_REQUEST_ID, -1L)
-                    if (activeSessionId == sessionId && pendingRequestId == requestId) {
-                        pendingRequestId = null
-                        showTranslationResult(
-                            captured = intent.getBooleanExtra(
-                                AppContracts.EXTRA_CAPTURED,
-                                false,
-                            ),
-                            sourceLines = readStringList(intent, AppContracts.EXTRA_SOURCE_LINES),
-                            translatedLines = readStringList(
-                                intent,
-                                AppContracts.EXTRA_TRANSLATED_LINES,
-                            ),
-                            errorMessage = intent.getStringExtra(
-                                AppContracts.EXTRA_ERROR_MESSAGE,
-                            ),
-                        )
-                    }
-                }
+    override fun onCaptureResult(result: CaptureResult) {
+        if (activeSessionId != result.sessionId || pendingRequestId != result.requestId) return
+        pendingRequestId = null
+        showTranslationResult(
+            captured = result.captured,
+            sourceLines = result.sourceLines,
+            translatedLines = result.translatedLines,
+            errorMessage = result.errorMessage,
+        )
+    }
 
-                AppContracts.ACTION_TRANSLATION_STATUS -> {
-                    // Keep the bubble hidden while the underlying app is being captured.
-                    // The final panel displays the actual OCR/translation result.
-                }
-
-                AppContracts.ACTION_CAPTURE_PERMISSION_NEEDED -> {
-                    setBubbleVisible(true)
-                    activeSessionId = null
-                    val requestId = intent.getLongExtra(AppContracts.EXTRA_REQUEST_ID, -1L)
-                    if (requestId > 0) pendingRequestId = requestId
-                    if (!permissionFlowActive) {
-                        permissionFlowActive = true
-                        launchCapturePermission()
-                    }
-                }
-
-                AppContracts.ACTION_CAPTURE_SESSION_STARTED -> {
-                    val sessionId = intent.getLongExtra(AppContracts.EXTRA_SESSION_ID, -1L)
-                    activeSessionId = sessionId.takeIf { it >= 0L }
-                    permissionFlowActive = false
-                }
-
-                AppContracts.ACTION_CAPTURE_SESSION_STOPPED -> {
-                    val sessionId = intent.getLongExtra(AppContracts.EXTRA_SESSION_ID, -1L)
-                    if (activeSessionId == null || activeSessionId == sessionId) {
-                        activeSessionId = null
-                        pendingRequestId = null
-                    }
-                    permissionFlowActive = false
-                    setBubbleVisible(true)
-                }
-
-                AppContracts.ACTION_CAPTURE_PERMISSION_CANCELLED -> {
-                    permissionFlowActive = false
-                    pendingRequestId = null
-                    setBubbleVisible(true)
-                }
-            }
+    override fun onCapturePermissionNeeded(requestId: Long) {
+        setBubbleVisible(true)
+        activeSessionId = null
+        if (requestId > 0) pendingRequestId = requestId
+        if (!permissionFlowActive) {
+            permissionFlowActive = true
+            launchCapturePermission()
         }
+    }
+
+    override fun onCaptureSessionStarted(sessionId: Long) {
+        activeSessionId = sessionId.takeIf { it >= 0L }
+        permissionFlowActive = false
+    }
+
+    override fun onCaptureSessionStopped(sessionId: Long) {
+        if (activeSessionId == null || activeSessionId == sessionId) {
+            activeSessionId = null
+            pendingRequestId = null
+        }
+        permissionFlowActive = false
+        setBubbleVisible(true)
+    }
+
+    override fun onCapturePermissionCancelled() {
+        permissionFlowActive = false
+        pendingRequestId = null
+        setBubbleVisible(true)
     }
 
     override fun onCreate() {
         super.onCreate()
         startOverlayForegroundService()
-        registerCaptureReceiver()
+        CaptureBus.register(this)
         showBubble()
     }
 
@@ -117,11 +92,8 @@ class FloatingTranslatorService : Service() {
     }
 
     override fun onDestroy() {
-        try {
-            unregisterReceiver(captureReceiver)
-        } catch (_: IllegalArgumentException) {
-            // The receiver was already unregistered.
-        }
+        CaptureBus.unregister(this)
+        clearOwnClipboard()
         resultPanel?.let { removeViewSafely(it) }
         bubble?.let { removeViewSafely(it) }
         resultPanel = null
@@ -134,28 +106,6 @@ class FloatingTranslatorService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun registerCaptureReceiver() {
-        val filter = IntentFilter().apply {
-            addAction(AppContracts.ACTION_CAPTURE_FINISHED)
-            addAction(AppContracts.ACTION_TRANSLATION_STATUS)
-            addAction(AppContracts.ACTION_CAPTURE_PERMISSION_NEEDED)
-            addAction(AppContracts.ACTION_CAPTURE_SESSION_STARTED)
-            addAction(AppContracts.ACTION_CAPTURE_SESSION_STOPPED)
-            addAction(AppContracts.ACTION_CAPTURE_PERMISSION_CANCELLED)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(captureReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(
-                captureReceiver,
-                filter,
-                AppContracts.INTERNAL_CAPTURE_RESULT_PERMISSION,
-                null,
-            )
-        }
-    }
 
     private fun startOverlayForegroundService() {
         createOverlayNotificationChannel()
@@ -322,8 +272,8 @@ class FloatingTranslatorService : Service() {
 
     private fun showTranslationResult(
         captured: Boolean,
-        sourceLines: ArrayList<String>,
-        translatedLines: ArrayList<String>,
+        sourceLines: List<String>,
+        translatedLines: List<String>,
         errorMessage: String?,
     ) {
         setBubbleVisible(true)
@@ -353,6 +303,7 @@ class FloatingTranslatorService : Service() {
             text = getString(R.string.close)
             setTextColor(getColorCompat(R.color.muted_text))
             setBackgroundColor(Color.TRANSPARENT)
+            filterTouchesWhenObscured = true
             setOnClickListener { removeResultPanel() }
         }
         header.addView(
@@ -433,6 +384,8 @@ class FloatingTranslatorService : Service() {
         val copyButton = Button(this).apply {
             text = getString(R.string.copy_translation)
             isEnabled = translatedLines.isNotEmpty()
+            // A malicious overlay must not be able to drive the copy action.
+            filterTouchesWhenObscured = true
             setOnClickListener { copyTranslation(sourceLines, translatedLines) }
         }
         actionRow.addView(copyButton)
@@ -443,7 +396,10 @@ class FloatingTranslatorService : Service() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                // The panel repeats text taken from another app's screen. Keep it
+                // out of screenshots and other apps' screen recordings.
+                WindowManager.LayoutParams.FLAG_SECURE,
             android.graphics.PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
@@ -495,10 +451,37 @@ class FloatingTranslatorService : Service() {
             if (target.isBlank()) source else "$source\n$target"
         }
         val clipboard = getSystemService(ClipboardManager::class.java) ?: return
-        clipboard.setPrimaryClip(
-            ClipData.newPlainText(getString(R.string.translation_label), text),
-        )
+        val clip = ClipData.newPlainText(getString(R.string.translation_label), text)
+        // This text was lifted off whatever the user had on screen, so it may be
+        // a one-time code or a private message. Marking it sensitive keeps
+        // Android 13+ from rendering it in the clipboard preview toast.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            clip.description.extras = PersistableBundle().apply {
+                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+            }
+        }
+        clipboard.setPrimaryClip(clip)
         Toast.makeText(this, getString(R.string.copied), Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Drops our own translation clip when the overlay is dismissed, so screen
+     * text does not outlive the session on the clipboard. Anything the user
+     * copied since is left alone.
+     */
+    private fun clearOwnClipboard() {
+        val clipboard = getSystemService(ClipboardManager::class.java) ?: return
+        try {
+            val label = clipboard.primaryClipDescription?.label ?: return
+            if (label != getString(R.string.translation_label)) return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                clipboard.clearPrimaryClip()
+            } else {
+                clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
+            }
+        } catch (_: RuntimeException) {
+            // Losing the clipboard race is not worth crashing the shutdown path.
+        }
     }
 
     private fun removeResultPanel() {
@@ -512,11 +495,6 @@ class FloatingTranslatorService : Service() {
         } catch (_: IllegalArgumentException) {
             // The window was already removed by the system.
         }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun readStringList(intent: Intent, key: String): ArrayList<String> {
-        return intent.getStringArrayListExtra(key) ?: arrayListOf()
     }
 
     private fun dp(value: Int): Int {

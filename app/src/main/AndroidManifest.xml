@@ -1,21 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <permission
-        android:name="com.example.floatingtranslator.permission.INTERNAL_CAPTURE_RESULT"
-        android:protectionLevel="signature" />
-    <uses-permission android:name="com.example.floatingtranslator.permission.INTERNAL_CAPTURE_RESULT" />
-
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Used only by ML Kit to download the on-device translation model once. -->
+    <!--
+      Required by ML Kit. It is used to download the English->Chinese translation
+      model on first use, and also by ML Kit's own reporting: the bundled Google
+      libraries send usage/diagnostic events and use a Firebase installation ID.
+      That reporting is on by default and there is no opt-out in these ML Kit
+      versions. Text recognized from the screen is never part of it -- OCR and
+      translation both run on device and the results stay in this process.
+    -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher"
