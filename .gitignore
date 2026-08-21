@@ -7,6 +7,7 @@ app/build/
 # Local signing material and machine-specific files
 *.jks
 *.keystore
+keystore.properties
 local.properties
 
 # Keep only the current distributable APK in the repository.

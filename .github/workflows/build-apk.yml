@@ -39,65 +39,60 @@ jobs:
         run: |
           python3 - <<'PY'
           import glob, sys, xml.dom.minidom as md
+          paths = sorted(glob.glob('app/src/**/*.xml', recursive=True))
           bad = []
-          for path in sorted(glob.glob('app/src/**/*.xml', recursive=True)):
+          for path in paths:
               try:
                   md.parse(path)
               except Exception as exc:
                   bad.append(f"{path}: {exc}")
           for line in bad:
               print(f"malformed: {line}")
-          print(f"checked {len(glob.glob('app/src/**/*.xml', recursive=True))} files, {len(bad)} malformed")
+          print(f"checked {len(paths)} files, {len(bad)} malformed")
           sys.exit(1 if bad else 0)
           PY
 
+      # Only runs when a keystore has been added to repository secrets. Without
+      # it the build still succeeds and produces an unsigned APK.
+      - name: Prepare signing material
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          keystore="$RUNNER_TEMP/release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$keystore"
+          echo "KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
+
+      # Gradle signs during packaging when KEYSTORE_PATH and the passwords are
+      # set; otherwise it emits app-release-unsigned.apk.
       - name: Assemble release
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew --no-daemon assembleRelease
 
       - name: Android lint
         continue-on-error: true
         run: ./gradlew --no-daemon lintRelease
 
-      # Signing runs only if a keystore has been added to repository secrets.
-      # Without it the job still produces an unsigned APK.
-      - name: Check for signing material
-        id: signing
-        run: echo "available=${{ secrets.KEYSTORE_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
-
-      - name: Sign release APK
-        if: steps.signing.outputs.available == 'true'
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          keystore="$RUNNER_TEMP/signing.jks"
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$keystore"
-          apksigner=$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner | sort -V | tail -1)
-          zipalign=$(find "$ANDROID_SDK_ROOT/build-tools" -name zipalign | sort -V | tail -1)
-          unsigned=app/build/outputs/apk/release/app-release-unsigned.apk
-          "$zipalign" -p -f 4 "$unsigned" "$RUNNER_TEMP/aligned.apk"
-          "$apksigner" sign \
-            --ks "$keystore" \
-            --ks-pass env:KEYSTORE_PASSWORD \
-            --ks-key-alias "$KEY_ALIAS" \
-            --key-pass env:KEY_PASSWORD \
-            --out app/build/outputs/apk/release/FloatingTranslator-signed.apk \
-            "$RUNNER_TEMP/aligned.apk"
-          rm -f "$keystore"
-          "$apksigner" verify --print-certs \
-            app/build/outputs/apk/release/FloatingTranslator-signed.apk
-
       - name: Report APK identity
         run: |
           set -euo pipefail
-          echo "### APK build" >> "$GITHUB_STEP_SUMMARY"
-          for f in app/build/outputs/apk/release/*.apk; do
-            echo "- \`$(basename "$f")\` — $(du -h "$f" | cut -f1) — sha256 \`$(sha256sum "$f" | cut -d' ' -f1)\`" \
-              >> "$GITHUB_STEP_SUMMARY"
-          done
+          apksigner=$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner | sort -V | tail -1)
+          {
+            echo "### APK build"
+            for f in app/build/outputs/apk/release/*.apk; do
+              echo "- \`$(basename "$f")\` — $(du -h "$f" | cut -f1) — sha256 \`$(sha256sum "$f" | cut -d' ' -f1)\`"
+              if "$apksigner" verify --print-certs "$f" > /tmp/certs.txt 2>/dev/null; then
+                echo "  - signed; $(grep -m1 'SHA-256 digest' /tmp/certs.txt || echo 'certificate details in log')"
+              else
+                echo "  - **unsigned** — cannot be installed until it is signed"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          "$apksigner" verify --print-certs app/build/outputs/apk/release/*.apk || true
 
       - uses: actions/upload-artifact@v4
         with:
